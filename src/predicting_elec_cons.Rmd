@@ -1,0 +1,1746 @@
+---
+title: "Predicting Electricity Consumption"
+author: "Alexander Kell"
+date: "09/12/2017"
+bibliography: library.bib
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+library(bibtex)
+library(glmnet)
+library(forecast)
+library(plyr)
+library(neuralnet)
+library(scales)
+library(cluster) 
+library(fpc)
+library(Rtsne)
+library(ggbiplot)
+library("keras")
+library("kerasR")
+library("e1071")
+library("randomForest")
+library("caret")
+
+```
+
+```{r import data}
+pre_survey = read.csv("Data/CER_Electricity_Data/Survey data - CSV format/only-required-questions Smart meters Residential pre-trial survey data.csv")
+
+load("/Users/b1017579/Documents/PhD/Projects/5. Irish_Data/Prediction_Cleaned/Data/file1_9.rds")
+```
+
+# Introduction
+
+Within the electricity sector, the need for accurate predictions is very important. Electricity must be used the moment it is generated if not stored. 
+
+Forecasting can be split into four categories, very short term load forecasting (VSTLF), short term load forecasting (STLF), medium term load forecasting (MTLF) and long term load forecasting (LTLF). The cut-off horizon for these categories are one day, two weeks and three years respectively [@Hong2016].
+
+This paper concentrates on very short term load forecasting, forecasting 30 minutes ahead. 
+
+# Data
+
+The data contains survey informtion on households as well as their electricity consumption. The electricity measurements were taken over a 17 month period between July 2009 and December 2010 at 30 minute intervals.
+
+The survey contains information such as age of inhabitants, number of inhabitants, appliance ownership and socio-economic dwelling.
+
+The load profile of a single household is shown below.
+
+
+```{r}
+ggplot(filter(file1_9, house_id==1002, date_time>"2009-07-20" & date_time<"2009-07-27"), aes(x=date_time, y=value)) + geom_line() + scale_x_datetime(labels = date_format("%a %d-%m-%y %r")) + xlab("Date and Time") + ylab("Electricity Consumption (kWh)") + ggtitle("Electricity consumption of a single household over a week period in kWh per \n30 minute period")
+```
+
+Electricity usage seems to be sporadic with little patterns between days, especially throughout the weekdays. Higher electricity usage is exhibited at the weekend, where the house may be populated, when compared to the weekend.
+
+```{r Displaying individual homes}
+ggplot(filter(file1_9, house_id==1004, date_time>"2009-07-20" & date_time<"2009-07-27"), aes(x=date_time, y=value)) + geom_line() + facet_wrap(~weekday, scales = "free_x", ncol = 2) + scale_x_datetime(labels = date_format("%H:%M")) + xlab("Time of Day") + ylab("Electricity Consumption (kWh)") + theme_bw(base_size = 18) + theme(panel.spacing.x = unit(2, "lines"))
+```
+
+
+```{r}
+
+file_overlay = file1_9 %>% mutate(time = lubridate::hour(date_time)+lubridate::minute(date_time)/60)
+
+ggplot(filter(file_overlay, house_id==1004, date_time>"2009-07-20" & date_time<"2009-07-27"), aes(x=time, y=value)) + geom_line(aes(colour = weekday)) + xlab("Time of Day") + ylab("Electricity Consumption (kWh)") + theme_bw(base_size = 18) + theme(panel.spacing.x = unit(2, "lines"))
+```
+
+```{r}
+
+customer_names <- list('1004'="Customer 1",
+                       '1005' = "Customer 2")
+
+customer_labeller = function(value){
+    return(customer_names[value])
+}
+
+labeled_data = filter(file1_9, house_id>100, house_id<1010)
+labeled_data$labels = customer_labeller(labeled_data$house_id)
+
+labeled_data = mutate(labeled_data, labels = case_when(house_id==1000 ~ "Customer 1",
+                      house_id==1001 ~ "Customer 2",
+                      house_id==1002 ~ "Customer 3",
+                      house_id==1003 ~ "Customer 4",
+                      house_id==1004 ~ "Customer 5",
+                      house_id==1005 ~ "Customer 6",
+                      house_id==1006 ~ "Customer 7",
+                      house_id==1009 ~ "Customer 8"))
+
+ggplot(filter(labeled_data, date_time>"2009-07-22" & date_time<"2009-07-23"), aes(x=date_time, y=value)) + geom_line() + facet_wrap(~labels, scales = "free_x", ncol = 2) + scale_x_datetime(labels = date_format("%H:%M")) + xlab("Time of Day") + ylab("Electricity Consumption (kWh)") + theme_bw(base_size = 18) + theme(panel.spacing.x = unit(2, "lines"))
+
+```
+
+
+
+```{r Similar Customers}
+
+labeled_data_sim = filter(file1_9, house_id==c(1004,1020,1032,1036))
+
+labeled_data_sim = mutate(labeled_data_sim, labels = case_when(
+    house_id==1004 ~ "Customer 1",
+                      house_id==1020 ~ "Customer 2",
+                      house_id==1032 ~ "Customer 3",
+                      house_id==1036 ~ "Customer 4"))
+
+
+
+ggplot(filter(labeled_data_sim, date_time>"2009-07-22" & date_time<"2009-07-23"), aes(x=date_time, y=value)) + geom_line() + facet_wrap(~labels, scales = "free", ncol = 2) + scale_x_datetime(labels = date_format("%H:%M")) + xlab("Time of Day (h)") + ylab("Electricity Consumption (kWh)") + theme_bw(base_size = 18) + theme(panel.spacing.x = unit(2, "lines"))
+
+```
+
+
+```{r Merging similar and different customers}
+
+
+labeled_data_cust = filter(file1_9, house_id==c(1004,1020,1021,1022)) %>% 
+                    mutate(labels = case_when(house_id==1004 ~ "Customer 1",
+                      house_id==1020 ~ "Customer 2",
+                      house_id==1021 ~ "Customer 3",
+                      house_id==1022 ~ "Customer 4"))
+
+
+ggplot(filter(labeled_data_cust, date_time>"2009-07-22" & date_time<"2009-07-23"), aes(x=date_time, y=value)) + geom_line() + facet_wrap(~labels, scales = "free", ncol = 2) + scale_x_datetime(labels = date_format("%H:%M")) + xlab("Time of Day") + ylab("Electricity Consumption (kWh)") + theme_bw(base_size = 18) #+ theme(panel.spacing.x = unit(2, "lines"))
+
+ggsave("similaranddifferentcust1.png")
+
+```
+
+## Features for Prediction
+
+This paper uses survey questions as answers as predictors for predicting electricity usage.
+
+To predict electricity consumption using historical data and survey answers it is important to select predictors which have a high correlation with consumption. A study by Beckel *et al* analysed the CER dataset to predict characteristics of a household using energy consumption data [@Beckel2014]. The characteristics related to a household's socio-economic status, dwelling or appliance stock. 
+
+They were able to predict the following characteristics with an accuracy over 60\%.
+\begin{itemize}
+   \item Single status
+   \item Whether all members of household were employed
+   \item Whether the house is unoccupied
+   \item Family status
+   \item Status of children
+   \item Cooking status
+   \item Retired status
+   \item Employment status
+   \item Floor area
+   \item Age of people in household
+\end{itemize}
+
+A study by Mcloughlin *et al.* identifies key variables that influence electricity consumption in the home [@McLoughlin2012]. 
+
+They found the following characteristics influenced domestic electricty consumption patterns.
+\begin{itemize}
+  \item Dwelling type
+  \item Household income
+  \item Appliance holdings
+  \item Number of occupants
+  \item Location
+  \item Household composition
+  \item Appliance rating
+  \item Floor area
+  \item Number of rooms
+\end{itemize}
+
+Due to over half of the respondents not providing answers to the floor area of their household, number of bedrooms was used as a proxy for this information.
+
+## Variable Selection
+
+To discover which of the variables have the greatest effect on electricity consumption I used a lasso linear regression model.
+
+I fit four lasso linear models against average consumption over all data, average maximum  consumption, average minimum consumption, and the sum of all consumption over the average day.
+
+
+The results for the average daily consumption are shown in the table 1.
+
+\begin{table}[h!]
+\centering
+\label{my-label}
+\begin{tabular}{|c|c|c|c|c|c|}
+\hline
+\multicolumn{5}{|c|}{\textbf{Table of Correlated Variables for Electricity Consumption}}                                                                           &                      \\ \hline
+\textbf{Variables}       & \textbf{Avg Consumption} & \textbf{Max Elec.} & \textbf{Min Elec.} & \textbf{Sum of Elec.} & \textbf{Total Count} \\ \hline
+Age                      &                              &                                   &                                   &                                  & 0                    \\ \hline
+Employment Status        & X                            & X                                 & X                                 & X                                & 4                    \\ \hline
+Social Class             & X                            & X                                 & X                                 & X                                & 4                    \\ \hline
+Single/Shared Household  & X                            &                                   & X                                 & X                                & 3                    \\ \hline
+Number of Adults         & X                            & X                                 & X                                 & X                                & 4                    \\ \hline
+Number of Children       & X                            & X                                 &                                   & X                                & 3                    \\ \hline
+Type of Home             & X                            &                                   & X                                 & X                                & 3                    \\ \hline
+Age of House             &                              &                                   &                                   &                                  & 0                    \\ \hline
+Number of Bedrooms       & X                            & X                                 & X                                 & X                                & 4                    \\ \hline
+Heating                  & X                            & X                                 & X                                 & X                                & 4                    \\ \hline
+Water Heating            & X                            & X                                 & X                                 & X                                & 4                    \\ \hline
+Cooking                  & X                            & X                                 & X                                 & X                                & 4                    \\ \hline
+Washing Machine          &                              &                                   & X                                 &                                  & 1                    \\ \hline
+Tumble Dryer             &                              &                                   & X                                 &                                  & 1                    \\ \hline
+Dishwasher               &                              &                                   & X                                 &                                  & 1                    \\ \hline
+Electric Shower          & X                            &                                   & X                                 & X                                & 3                    \\ \hline
+Electric Cooker          & X                            & X                                 &                                   & X                                & 3                    \\ \hline
+Electric Heater          & X                            & X                                 & X                                 &                                  & 3                    \\ \hline
+Stand alone freezer      & X                            & X                                 &                                   &                                  & 2                    \\ \hline
+Water Pump               &                              &                                   & X                                 &                                  & 1                    \\ \hline
+Washing Machine          &                              &                                   &                                   &                                  & 0                    \\ \hline
+Tumble Dryer             & X                            & X                                 &                                   & X                                & 3                    \\ \hline
+Dishwasher               & X                            &                                   &                                   & X                                & 2                    \\ \hline
+Water Pump               &                              & X                                 &                                   &                                  & 1                    \\ \hline
+Energy Saving Lightbulbs &                              &                                   & X                                 &                                  & 1                    \\ \hline
+Double Glazed Windows    & X                            &                                   &                                   & X                                & 2                    \\ \hline
+Insulated Walls          &                              &                                   &                                   &                                  & 0                    \\ \hline
+Education Level          & X                            &                                   & X                                 & X                                & 3                    \\ \hline
+\end{tabular}
+\caption{Variable selection using lasso linear model predictor results}
+\end{table}
+
+
+The following variables appear in more than 3 out of the 4 linear models.
+
+\begin{itemize}
+  \item Employment Status
+  \item Social Class
+  \item Single/Shared Household
+  \item Number of Adults
+  \item Number of Children
+  \item Type of Home
+  \item Number of Bedrooms
+  \item Heating
+  \item Water heating
+  \item Cooking
+  \item Electric Shower Ownership
+  \item Electric Cooker
+  \item Electric Heater
+  \item Tumble Dryer
+\end{itemize}
+
+Therefore these variable were chosen to cluster indivudal households.
+
+## Clustering of Survey Data
+
+```{r Taking an average consumption}
+
+file1_10 = ddply(file1_9, .(house_id), mutate, mean_val=mean(value), scaled_val=value/mean_val)
+
+average_cons_p_id = ddply(file1_10, .(house_id,hour), summarise, mean_cons=mean(scaled_val))
+
+average_cons_p_id_wide = spread(average_cons_p_id, key = hour, value = mean_cons)
+
+pre_survey_filtered = merge(pre_survey, average_cons_p_id_wide, by.y = "house_id", by.x = "ID") 
+pre_survey_filtered = pre_survey_filtered[1:51]
+avg_cons_survey = merge(average_cons_p_id_wide, pre_survey[1:51], by.x = "house_id", by.y = "ID")
+```
+
+
+Due the survey data containing mixed variables, both continuous and discrete, the gower metric was used to measure distance between each of the observations. These observations were clustered using the "Partitioning Around Medoids" technique. 
+
+The number of clusters was chosen based on the average silhouette distance. The optimum number of clusters in this case was found to be 2. 
+
+
+```{r Gowers Distance Distance Metric}
+g_dist_survey = daisy(pre_survey_filtered[,2:51], metric = "gower")
+g_dist_surv_avgcons = daisy(avg_cons_survey[2:99], metric = "gower")
+```
+
+```{r Partitioning Around Medoids (PAM) Survey}
+pc = pamk(g_dist_survey, krange = 1:5, criterion = "asw")
+cluster_survey = data.frame(clusters = pc$pamobject$clustering)
+
+tsne_survey = Rtsne(g_dist_survey, is_distance = TRUE)
+tsne_surv_data = tsne_survey$Y %>% data.frame %>% setNames(c("X","Y")) %>% mutate(cluster=factor(pc$pamobject$clustering))
+
+ggplot(tsne_surv_data, aes(x=X, y=Y)) + geom_point(aes(color=cluster)) + labs(title="t-SNE of Survey Data with Clusters Implemented by Partitioning \nAround Medoids")
+```
+
+```{r Partitioning Around Medoids (PAM) Survey and Average Consumption}
+pc_cons = pamk(g_dist_surv_avgcons, krange = 1:5, criterion = "asw")
+cluster_survey = data.frame(clusters = pc_cons$pamobject$clustering)
+survey_clustered = cbind.data.frame(pre_survey_filtered, cluster_survey)
+
+tsne_survey = Rtsne(g_dist_surv_avgcons, is_distance = TRUE)
+tsne_surv_data = tsne_survey$Y %>% data.frame %>% setNames(c("X","Y")) %>% mutate(cluster=factor(pc_cons$pamobject$clustering))
+
+ggplot(tsne_surv_data, aes(x=X, y=Y)) + geom_point(aes(color=cluster)) + labs(title="t-SNE of Survey Data and Average Consumption Data with Clusters \nImplemented by Partitioning Around Medoids")
+```
+```{r time domain clustering of survey and average consumption}
+
+surv_avg_cons_clust = cbind(avg_cons_survey[1:49], cluster = pc_cons$pamobject$clustering)
+
+
+cluster_surv_cons_long = gather(surv_avg_cons_clust, key="hour", value="scaled_value", -cluster, -house_id)
+cluster_surv_cons_long$hour = as.numeric(cluster_surv_cons_long$hour)
+
+avg_cluster_surv = ddply(cluster_surv_cons_long, .(cluster, hour), summarise, mean_value = mean(scaled_value))
+
+ggplot(avg_cluster_surv, aes(x=hour, y=mean_value)) + geom_line() + facet_wrap(~cluster)
+
+
+
+```
+
+
+The optimum number of clusters is found using the average silhouette width.
+
+
+
+```{r k-means clustering of scaled data silhouette width}
+# Calculate average silhouette width
+k_max = 10
+sil=rep(0, k_max)
+for(i in 2:k_max){
+    km_res = kmeans(average_cons_p_id_wide[2:49], i, nstart=1000)
+    ss = silhouette(km_res$cluster, dist(average_cons_p_id_wide[2:49]))
+    sil[i] = mean(ss[, 3])
+}
+silhouette_dat = data.frame(num_of_clust = 1:length(sil), mean_width = sil)
+
+ggplot(silhouette_dat, aes(x=num_of_clust, y=mean_width)) + geom_line() + geom_point() + scale_x_continuous(breaks=c(1:10)) + xlab("Number of Clusters") + ylab("Average silhouette width") + theme_bw() + geom_vline(xintercept = 2, linetype="dotted")
+
+```
+
+```{r kmeans of scaled data}
+
+km_res = list()
+for(i in 1:10){
+    km_res[[i]] = kmeans(average_cons_p_id_wide[2:49], i, nstart=1000)
+}
+
+
+pca = prcomp(average_cons_p_id_wide[2:49])
+ggbiplot(pca, groups = factor(km_res$cluster)) + labs(title="PCA of K-Means Results of Scaled Data \nVisualised with PCA")
+
+```
+
+
+```{r}
+
+centres = gather(data.frame(clusters=c("Cluster 1", "Cluster 2", "Cluster 3", "Cluster 4"),km_res[[4]]$centers, fix.empty.names = FALSE),key="time",value="centre", X0:X23.5)
+
+centres$time = substring(centres$time,2)
+centres$time = as.numeric(centres$time)
+
+ggplot(centres, aes(x=time,y=centre))+geom_line()+facet_wrap(~clusters) + xlab("Time of Day (h)") + ylab("Scaled Electricity Consumption") + theme_bw(base_size = 18)
+
+
+ggplot(centres, aes(x=time,y=centre))+geom_line()+facet_wrap(~clusters, nrow=1) + xlab("Time of Day (h)") + ylab("Scaled Electricity Consumption") + theme_bw(base_size = 18)
+
+centre = ggplot(centres, aes(x=time,y=centre,frame=clusters))+geom_line() + xlab("Time of Day (h)") + ylab("Scaled Electricity Consumption") + theme_bw(base_size = 18)
+
+gganimate(centre)
+
+```
+
+
+
+```{r time series of clustered data}
+
+cluster_data = list()
+cluster_scaled_list = list()
+for(i in 1:10){
+    cluster_scaled = cbind(average_cons_p_id_wide, cluster = km_res[[i]]$cluster)
+    cluster_scaled_long = gather(cluster_scaled, key="hour", value="scaled_value", -cluster, -house_id)
+    cluster_scaled_long$hour = as.numeric(cluster_scaled_long$hour)
+    cluster_scaled_list[[i]] = cluster_scaled
+    cluster_data[[i]] = cluster_scaled_long
+}
+
+cluster_data_agg = list()
+for(i in 1:10){
+    cluster_data_agg[[i]] = ddply(cluster_data[[i]], .(cluster, hour), summarise, mean_value = mean(scaled_value))
+}
+
+ggplot(cluster_data_agg[[10]], aes(x=hour, y=mean_value)) + geom_line() + facet_wrap(~cluster)
+
+
+```
+
+
+# Fitting of Models
+
+```{r Normalize functions}
+normalize <- function(vec, min, max) {
+  (vec-min) / (max-min)
+}
+denormalize <- function(vec,min,max) {
+  vec * (max - min) + min
+}
+```
+
+
+
+```{r test and training set - Clustered}
+
+norm_agg_clust = list()
+for(i in 1:10){
+    file1_9_clust = merge(file1_9,select(cluster_scaled_list[[i]], house_id, cluster), by = "house_id")
+    aggreg_clust = file1_9_clust %>% dplyr::group_by(date_time, cluster) %>% dplyr::summarise(agg_value=sum(value))
+    
+    norm_agg_clust[[i]] = ddply(aggreg_clust, .(cluster), mutate, scaled_agg = normalize(agg_value, max = max(agg_value), min = min(agg_value)))
+
+}
+
+ggplot(filter(aggreg_clust, date_time>"2010-07-01", date_time<"2010-07-09"), aes(x=date_time, y=agg_value)) + geom_line() + facet_wrap(~cluster)
+
+
+ggplot(filter(norm_agg_clust[[10]]), aes(x=date_time, y=scaled_agg)) + geom_line() + facet_wrap(~cluster)
+
+```
+
+
+## Neural Network
+
+```{r}
+
+trainIndex_nn = createDataPartition(train_mm[[1]]$scaled_agg, p=0.01, list=FALSE)
+
+trainData_nn = train_mm[[1]][trainIndex_nn,]
+testData_nn = train_mm[[1]][-trainIndex_nn,]
+
+
+trainData_nn = plyr::rename(trainData_nn,c(
+    "day_of_week^4"="day_of_week4",
+    "day_of_week^5"="day_of_week5",
+    "day_of_week^6"="day_of_week6",
+    "month^4" = "month4",
+    "month^5" = "month5",
+    "month^6" = "month6",
+    "month^7" = "month7",
+    "month^8" = "month8",
+    "month^9" = "month9",
+    "month^10" = "month10",
+    "month^11" = "month11"
+    ))
+
+
+trainData_nn = na.omit(trainData_nn)
+
+# Exploring different kernels
+
+
+neuralnet.tune = train(scaled_agg ~hour + `day_of_month` + `day_of_week.L` + `day_of_week.Q` + `day_of_week.C` + `day_of_week4` + `day_of_week5` + `day_of_week6` + month.L + month.Q + month.C + `month4` + `month5` + `month6` + `month7` + `month8` + `month9` + `month10` + `month11` + `Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1, method = "neuralnet",data=trainData_nn, tuneLength = 9, metric = "RMSE")
+
+ggplot(neuralnet.tune$results, aes(x=layer1, y=RMSE)) + geom_line() + theme_bw() + xlab("Number of variables randomly sampled as candidates at each split") + ylab("RMSE")
+
+nn_grid = expand.grid(layer1=c(1,2,3),layer2=c(1,2,3,4,5,10,100),layer3=c(0))
+
+neuralnet.tune2 = train(scaled_agg ~hour + `day_of_month` + `day_of_week.L` + `day_of_week.Q` + `day_of_week.C` + `day_of_week4` + `day_of_week5` + `day_of_week6` + month.L + month.Q + month.C + `month4` + `month5` + `month6` + `month7` + `month8` + `month9` + `month10` + `month11` + `Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1, method = "neuralnet",data=trainData_nn, tuneGrid = nn_grid, metric = "RMSE")
+
+
+nn_grid3 = expand.grid(layer1=c(1,2,3),layer2=c(4,5,6,7),layer3=c(1,2,3,4,5,6,7,10,100))
+
+neuralnet.tune3 = train(scaled_agg ~hour + `day_of_month` + `day_of_week.L` + `day_of_week.Q` + `day_of_week.C` + `day_of_week4` + `day_of_week5` + `day_of_week6` + month.L + month.Q + month.C + `month4` + `month5` + `month6` + `month7` + `month8` + `month9` + `month10` + `month11` + `Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1, method = "neuralnet",data=trainData_nn, tuneGrid = nn_grid3, metric = "RMSE")
+
+
+```
+
+
+
+```{r}
+nn_data1_2 = list()
+for(i in 1:10){
+    nn_data = norm_agg_clust[[i]] %>% mutate(hour=lubridate::hour(date_time)+lubridate::minute(date_time)/60,
+                                day_of_month = lubridate::day(date_time),
+                                day_of_week = lubridate::wday(date_time, label=TRUE),
+                                month = lubridate::month(date_time, label=TRUE))
+    
+    nn_data1_1 = nn_data %>% mutate(Value_1=lag(scaled_agg), Value_2=lag(scaled_agg,2), Value_3=lag(scaled_agg,3), Value_4=lag(scaled_agg,4), Value_5=lag(scaled_agg,5), Value_6=lag(scaled_agg,6), Prev_day1=lag(scaled_agg, 48), Prev_day2=lag(scaled_agg, 49), Prev_day3=lag(scaled_agg, 50), Prev_day4=lag(scaled_agg, 51), Prev_day5=lag(scaled_agg, 52), Prev_day6=lag(scaled_agg, 53), Prev_day7=lag(scaled_agg, 54), Week_1=lag(scaled_agg,336), Week_2=lag(scaled_agg,337), Week_3=lag(scaled_agg,338), Week_4=lag(scaled_agg,339), Week_5=lag(scaled_agg,340), Week_6=lag(scaled_agg,341),Week_7=lag(scaled_agg,342))
+    
+    nn_data1_2_1 = na.omit(nn_data1_1)
+    
+    holidays = lubridate::date(c(
+        "2009-08-03","2009-10-26","2009-12-25","2009-12-28",
+        "2010-01-01","2010-03-17","2010-04-05","2010-05-03","2010-06-07","2010-08-02","2010-10-25","2010-12-27"
+        ))
+    
+    nn_data1_2[[i]] = nn_data1_2_1 %>% mutate(date=lubridate::date(date_time), holiday = as.factor(ifelse(date %in% holidays,1,0)))
+}
+```
+
+```{r Neural Network Function}
+
+NN = function(train, thresh){
+    NN_mod1 = neuralnet(scaled_agg ~hour + day_of_month + day_of_week.L + day_of_week.Q + day_of_week.C + `day_of_week^4` + `day_of_week^5` + `day_of_week^6` + month.L + month.Q + month.C + `month^4` + `month^5` + `month^6` + `month^7` + `month^8` + `month^9` + `month^10` + `month^11` + `Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1, train, threshold = thresh, stepmax = 1e+07, hidden=c(2,5,4), lifesign = "minimal")
+    return(NN_mod1)
+}
+
+computeNN = function(NN, df){
+    predicted = compute(NN, select(df[,-1], -date_time, -cluster, -agg_value, -scaled_agg,-date))
+    df$predicted = predicted$net.result
+  return(df)
+}
+
+mape = function(real,pred){
+  return(100*mean(abs((real-pred)/real)))
+}
+
+```
+
+```{r NN}
+train_mm = list()
+test_mm = list()
+for(i in 1:7){
+    train = filter(nn_data1_2[[i]], date_time < "2010-06-15") 
+    test = filter(nn_data1_2[[i]], date_time >= "2010-06-15")
+    
+    train_mm[[i]] = as.data.frame(model.matrix(data=train, ~.))
+    test_mm[[i]] = as.data.frame(model.matrix(data=test, ~.)) %>% mutate(date_time = as.POSIXct(date_time, origin='1970-01-01'))
+}
+
+nn_bootstrap = list()
+mape_nn = list()
+
+dfs = list()
+dfs_nn_bootstrap = list()
+
+for(m in 1){    
+    for(i in 1:7){
+        clustered_NN_models = dlply(train_mm[[i]], .(cluster), NN, thresh = 0.1)
+        result=data.frame()
+        for(j in 1:range(train_mm[[i]]$cluster)[2]){
+            res = computeNN(clustered_NN_models[[j]], filter(test_mm[[i]],cluster==j))
+            result = rbind(result,res)
+        }
+        df = ddply(result, .(date_time), summarise, clust_agg=sum(scaled_agg), pred_agg = sum(predicted))
+        mape_nn[[i]] = mape(df$clust_agg, df$pred_agg)
+        dfs[[i]] = df
+    }
+    nn_bootstrap[[m]]=mape_nn
+    dfs_nn_bootstrap[[m]] = dfs
+}
+
+nn_bootstrap[[1]][[5]]=mape_nn[[5]]
+
+
+mape_nn_df = data.frame(mape=unlist(mape_nn), cluster=1:7)
+
+ggplot(mape_nn_df, aes(x=cluster, y=mape))+geom_line()
+
+paste("Min MAPE ",min(mape_nn_df$mape),"%")
+
+```
+
+
+```{r MASE NN}
+
+dfs_nn_bootstrap1_1 = llply(dfs_nn_bootstrap, function(x) llply(x, mutate, naive_model = lag(clust_agg,336)))
+
+
+mase_snn = llply(dfs_nn_bootstrap1_1, function(x) laply(x, function(y) mase(y$pred_agg, y$naive_model, y$clust_agg, 336)))
+
+
+plot(unlist(mase_snn), type="l")
+
+```
+
+
+
+```{r No Calendar Variables NN}
+
+NN_no_cal = function(train, thresh){
+    NN_mod1 = neuralnet(scaled_agg ~ `Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1, train, threshold = thresh, stepmax = 1e+07, hidden=c(2,5,4), lifesign = "minimal")
+    return(NN_mod1)
+}
+
+computeNN_no_cal = function(NN, df){
+    predicted = compute(NN, select(df[,-1], -hour, -day_of_month, -day_of_week.L, -day_of_week.Q, -day_of_week.C, -`day_of_week^4`, -`day_of_week^5`, -`day_of_week^6`, -month.L, -month.Q, -month.C, -`month^4`, -`month^5`, -`month^6`, -`month^7`, -`month^8`, -`month^9`, -`month^10`, -`month^11`, -date_time, -cluster, -agg_value, -scaled_agg,-date))
+    df$predicted = predicted$net.result
+  return(df)
+}
+
+
+
+nn_bootstrap_no_cal = list()
+mape_nn = list()
+for(m in 1:5){
+    for(i in 4){
+        clustered_NN_models = dlply(train_mm[[i]], .(cluster), NN_no_cal, thresh = 0.1)
+        result=data.frame()
+        for(j in 1:range(train_mm[[i]]$cluster)[2]){
+            res = computeNN_no_cal(clustered_NN_models[[j]], filter(test_mm[[i]],cluster==j))
+            result = rbind(result,res)
+        }
+        df = ddply(result, .(date_time), summarise, clust_agg=sum(scaled_agg), pred_agg = sum(predicted))
+        mape_nn[[i]] = mape(df$clust_agg, df$pred_agg)
+    }
+   nn_bootstrap_no_cal[[m]]=mape_nn 
+}
+
+
+```
+
+
+# Single LSTM - No clusters
+
+
+```{r}
+load("/Users/b1017579/Documents/PhD/Projects/5. Irish_Data/Prediction_Cleaned/Data/MAPE_6month.rds")
+
+
+
+MAPE_output_mat = unlist(MAPE_output)
+MAPE_output_df = data.frame(LSTM_stacks = rep(c(1,2,3,4), each=12), Memory_Units= c(5,6,7,8,9,10,20,30,40,50,75,100), MAPE= MAPE_output_mat)
+
+ggplot(filter(MAPE_output_df, Memory_Units>10), aes(x=Memory_Units, y=MAPE, colour=factor(LSTM_stacks))) + geom_line()
+
+ggplot(filter(MAPE_output_df, Memory_Units<=10), aes(x=Memory_Units, y=MAPE, colour=factor(LSTM_stacks))) + geom_line()
+
+ggplot(MAPE_output_df, aes(x=Memory_Units, y=MAPE, colour=factor(LSTM_stacks))) + geom_line()
+
+
+
+```
+
+```{r}
+
+train_lstm = filter(agg_no_clus, date_time < "2010-06-15")$sum_value
+test_lstm = filter(agg_no_clus, date_time >= "2010-06-15")$sum_value
+
+minval = min(train_lstm)
+maxval = max(train_lstm)
+
+train_lstm_norm = normalize(train_lstm, minval, maxval)
+test_lstm_norm = normalize(test_lstm, minval, maxval)
+
+lstm_num_timesteps <- 5
+
+# Supervised Machine Learning Data Format
+X_train_lstm = t(sapply(1:(length(train_lstm_norm) - lstm_num_timesteps), function(x) train_lstm_norm[x:(x + lstm_num_timesteps - 1)]))
+
+y_train_lstm = sapply((lstm_num_timesteps + 1):(length(train_lstm_norm)), function(x) train_lstm_norm[x])
+
+
+X_test_lstm = t(sapply(1:(length(test_lstm_norm) - lstm_num_timesteps), function(x) test_lstm_norm[x:(x + lstm_num_timesteps - 1)]))
+
+y_test_lstm = sapply((lstm_num_timesteps + 1):(length(test_lstm_norm)), function(x) test_lstm_norm[x])
+
+# Convert to 3D for input to LSTM
+X_train_lstm = kerasR::expand_dims(X_train_lstm, axis=2)
+X_test_lstm = kerasR::expand_dims(X_test_lstm, axis=2)
+
+num_samples = dim(X_train_lstm)[1]
+num_steps = dim(X_train_lstm)[2]
+num_features = dim(X_train_lstm)[3]
+
+```
+
+
+
+```{r LSTM with Varying Memory Units and Layers}
+
+createLSTM = function(memUnits, LSTM_Units, X_train, y_train, epoch){
+  # Create LSTM Nerual Network
+  single_LSTM = Sequential()
+  if(LSTM_Units==1){
+    single_LSTM$add(LSTM(units=memUnits, input_shape = c(num_steps, num_features), activation = "relu"))
+  }else{
+    single_LSTM$add(LSTM(units=memUnits, input_shape = c(num_steps, num_features), activation = "relu", return_sequences = TRUE))
+    for(i in 2:LSTM_Units){
+      if(i<LSTM_Units){
+        single_LSTM$add(LSTM(units=memUnits, return_sequences = TRUE))
+      }else{
+        single_LSTM$add(LSTM(units=memUnits))
+      }
+    }
+  }
+  single_LSTM$add(Dense(1))
+  keras_compile(single_LSTM, loss='mean_squared_error', optimizer='adam')
+  keras_fit(single_LSTM, X_train, y_train, batch_size = 1, epochs = epoch, verbose = 2)
+  
+  return(list(memUnits,LSTM_Units,single_LSTM))
+}
+
+predictLSTM = function(model, X_test, test_lstm, minval, maxval){
+  print("predicting")
+  pred_test = keras_predict(model, X_test, batch_size=1, verbose = 2)
+  print("predicted")
+  pred_test_denorm = denormalize(pred_test, minval, maxval)
+
+  mape = mape(test_lstm, pred_test_denorm[,1])
+  return(mape)
+}
+```
+
+```{r Create LSTM Models with Varying Configurations}
+# LSTMModels = mapply(function (x,y) createLSTM(x, y , X_train_lstm, y_train_lstm,4),
+#   c(5,6,7,8,9,10,20,30,40,50,75,100),rep(c(1,2,3,4),each=12)
+#   )
+# 
+# for(i in 1:length(LSTMModels)){
+#   keras_save(LSTMModels[[i]], path=paste("model",i,".h5", sep = ""))
+# }
+# 
+# 
+# print(LSTMModels)
+```
+
+```{r}
+# 
+# MAPE_output = lapply(LSTMModels, function(x) predictLSTM(x, X_test_lstm, test_lstm[5:9599], minval, maxval))
+# 
+# save(MAPE_output, file="MAPE_6month.rds")
+# load("MAPE_6month.rds")
+# 
+# 
+# MAPE_output_mat = unlist(MAPE_output)
+# MAPE_output_df = data.frame(LSTM_stacks = rep(c(1,2,3,4), each=12), Memory_Units= c(5,6,7,8,9,10,20,30,40,50,75,100), MAPE= MAPE_output_mat)
+
+```
+
+
+
+```{r}
+predictLSTM_clus = function(model, X_test, formatted_data){
+    print("predicting")
+    pred_test = keras_predict(model, X_test, batch_size=1, verbose = 2)
+    print("predicted")
+    formatted_data$predicted = as.numeric(pred_test)
+    return(formatted_data)
+}
+
+```
+
+
+## LSTM - No Clusters
+
+```{r Create Model}
+LSTM_no_clus = createLSTM(10, 1, X_train_lstm,y_train_lstm,4)
+predicted_single_LSTM = predictLSTM_clus(LSTM_no_clus[[3]], X_test_lstm, test_no_clus_mm[5:9599,])
+
+
+ggplot(filter(predicted_single_LSTM, date_time>"2010-06-15", date_time<"2010-06-21"), aes(x=date_time)) + geom_line(aes(y=scaled_agg)) + geom_line(aes(y=predicted, colour="predicted"))
+
+paste("MAPE of single LSTM ", mape(predicted_single_LSTM$scaled_agg, predicted_single_LSTM$predicted),"%")
+
+
+```
+
+## LSTM with Clusters
+
+
+```{r}
+train_list = list()
+test_list = list()
+
+lstm_num_timesteps <- 5
+
+X_train = list()
+y_train = list()
+
+X_test = list()
+y_test = list()
+
+LSTM_Models = list()
+for(i in 1:4){
+    i=1
+    
+    train_list[[i]] = filter(nn_data1_2[[4]], date_time < "2010-06-15", cluster==i)$scaled_agg
+    test_list[[i]] = filter(nn_data1_2[[4]], date_time >= "2010-06-15", cluster==i)$scaled_agg
+
+    # Supervised Machine Learning Data Format
+    X_train[[i]] = t(sapply(1:(length(train_list[[i]]) - lstm_num_timesteps), function(x) train_list[[i]][x:(x + lstm_num_timesteps - 1)]))
+    
+    y_train[[i]] = sapply((lstm_num_timesteps + 1):(length(train_list[[i]])), function(x) train_list[[i]][x])
+    
+    X_test[[i]]= t(sapply(1:(length(test_list[[i]]) - lstm_num_timesteps), function(x) test_list[[i]][x:(x + lstm_num_timesteps - 1)]))
+
+    y_test[[i]] = sapply((lstm_num_timesteps + 1):(length(test_list[[i]])), function(x) test_list[[i]][x])
+    
+    X_train[[i]] = kerasR::expand_dims(X_train[[i]], axis=2L)
+    X_test[[i]] = kerasR::expand_dims(X_test[[i]], axis=2L)
+    
+    num_samples = dim(X_train_lstm)[1]
+    num_steps = dim(X_train_lstm)[2]
+    num_features = dim(X_train_lstm)[3]
+    
+    LSTM_Models[[i]] = createLSTM(10, 1, X_train[[i]], y_train[[i]], 4)
+
+}
+
+
+
+
+
+
+ multi_LSTM_res = data.frame()
+ for(i in 1:4){
+    lstm_1 = predictLSTM_clus(LSTM_Models[[i]][[3]], X_test[[i]], arrange(filter(test_mm,cluster==i)[5:9599,],date_time))
+    multi_LSTM_res = rbind(multi_LSTM_res,lstm_1)
+}
+ 
+ggplot(filter(multi_LSTM_res, cluster==4,date_time>'2010-06-15', date_time<'2010-06-21'),aes(x=date_time)) + geom_line(aes(y=scaled_agg)) + geom_line(aes(y=predicted, colour="predicted"))
+ 
+multi_LSTM_total_res = ddply(multi_LSTM_res, .(date_time), summarise, actual=sum(scaled_agg), predicted = sum(predicted))
+
+
+paste("MAPE of multiple LSTM's predicting 6 months of aggregated electricity consumption ",mape(multi_LSTM_total_res$actual, multi_LSTM_total_res$predicted),"%")
+
+```
+
+```{r}
+LSTM_predicted = lapply(1:4, function(x) predictLSTM_clus(LSTM_Models[[x]][[3]], X_test[[x]]))
+y_test[[x]]
+
+```
+
+## LSTM Varying Clusters
+
+```{r}
+
+
+
+LSTM_Models = list()
+
+lstm_bootstrap=list()
+mape_lstm = list()
+
+df_lstm_bootstrap = list()
+dfs = list()
+for(m in 1){
+    for(j in 1:7){
+        j=3
+        train_list = list()
+        test_list = list()
+    
+        lstm_num_timesteps <- 5
+    
+        X_train = list()
+        y_train = list()
+    
+        X_test = list()
+        y_test = list()
+        
+        multi_LSTM_res = data.frame()
+        
+        for(i in 1:range(nn_data1_2[[j]]$cluster)[2]){
+            
+    
+            train_list[[i]] = filter(nn_data1_2[[j]], date_time < "2010-06-15", cluster==i)$scaled_agg
+            test_list[[i]] = filter(nn_data1_2[[j]], date_time >= "2010-06-15", cluster==i)$scaled_agg
+        
+            # Supervised Machine Learning Data Format
+            X_train[[i]] = t(sapply(1:(length(train_list[[i]]) - lstm_num_timesteps), function(x) train_list[[i]][x:(x + lstm_num_timesteps - 1)]))
+            
+            y_train[[i]] = sapply((lstm_num_timesteps + 1):(length(train_list[[i]])), function(x) train_list[[i]][x])
+            
+            X_test[[i]]= t(sapply(1:(length(test_list[[i]]) - lstm_num_timesteps), function(x) test_list[[i]][x:(x + lstm_num_timesteps - 1)]))
+        
+            y_test[[i]] = sapply((lstm_num_timesteps + 1):(length(test_list[[i]])), function(x) test_list[[i]][x])
+            
+            X_train[[i]] = kerasR::expand_dims(X_train[[i]], axis=2)
+            X_test[[i]] = kerasR::expand_dims(X_test[[i]], axis=2)
+            
+            num_samples = dim(X_train_lstm)[1]
+            num_steps = dim(X_train_lstm)[2]
+            num_features = dim(X_train_lstm)[3]
+            
+            LSTM_Models[[i]] = createLSTM(50, 2, X_train[[i]], y_train[[i]], 2)
+        
+    
+            lstm_1 = predictLSTM_clus(LSTM_Models[[i]][[3]], X_test[[i]], arrange(filter(test_mm[[j]],cluster==i)[5:9599,],date_time))
+            multi_LSTM_res = rbind(multi_LSTM_res,lstm_1)
+    
+        }
+        df = ddply(multi_LSTM_res, .(date_time), summarise, clust_agg=sum(scaled_agg), pred_agg = sum(predicted))
+        mape_lstm[[j]] = mape(df$clust_agg, df$pred_agg)
+        dfs[[j]] = df
+    # }
+    lstm_bootstrap[[m]]=mape_lstm
+    df_lstm_bootstrap[[m]] = dfs
+}
+
+
+
+
+
+
+  multi_LSTM_res = data.frame()
+ for(i in 1:4){
+    lstm_1 = predictLSTM_clus(LSTM_Models[[i]][[3]], X_test[[i]], arrange(filter(test_mm,cluster==i)[5:9599,],date_time))
+    multi_LSTM_res = rbind(multi_LSTM_res,lstm_1)
+}
+ 
+ggplot(filter(multi_LSTM_res, cluster==4,date_time>'2010-06-15', date_time<'2010-06-21'),aes(x=date_time)) + geom_line(aes(y=scaled_agg)) + geom_line(aes(y=predicted, colour="predicted"))
+ 
+multi_LSTM_total_res = ddply(multi_LSTM_res, .(date_time), summarise, actual=sum(scaled_agg), predicted = sum(predicted))
+
+
+paste("MAPE of multiple LSTM's predicting 6 months of aggregated electricity consumption ",mape(multi_LSTM_total_res$actual, multi_LSTM_total_res$predicted),"%")
+    
+
+```
+
+```{r MASE LSTM}
+
+dfs_lstm_bootstrap1_1 = llply(df_lstm_bootstrap, function(x) llply(x, mutate, naive_model = lag(clust_agg,336)))
+
+
+mase_lstm = llply(dfs_lstm_bootstrap1_1, function(x) laply(x, function(y) mase(y$pred_agg, y$naive_model, y$clust_agg, 336)))
+
+
+plot(unlist(mase_lstm), type="l")
+
+
+```
+
+
+# SVM
+
+## Tuning SVR Parameters
+
+```{r Tune SVR Parameters}
+
+data(train_mm[[1]])
+
+trainIndex = createDataPartition(train_mm[[1]]$scaled_agg, p=0.75, list=FALSE)
+
+trainData = train_mm[[1]][trainIndex,]
+testData = train_mm[[1]][-trainIndex,]
+
+svm.tune = train(scaled_agg ~hour + day_of_month + day_of_week.L + day_of_week.Q + day_of_week.C + `day_of_week^4` + `day_of_week^5` + `day_of_week^6` + month.L + month.Q + month.C + `month^4` + `month^5` + `month^6` + `month^7` + `month^8` + `month^9` + `month^10` + `month^11` + `Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1, method = "svmRadial",data=trainData, tuneLength = 9, metric = "RMSE")
+
+
+# Data
+
+trainIndex_svm2 = createDataPartition(train_mm[[1]]$scaled_agg, p=0.1, list=FALSE)
+
+trainData_svm2 = train_mm[[1]][trainIndex_svm2,]
+testData_svm2 = train_mm[[1]][-trainIndex_svm2,]
+
+
+# Exploring different kernels
+
+svm.tune_linear = train(scaled_agg ~hour + day_of_month + day_of_week.L + day_of_week.Q + day_of_week.C + `day_of_week^4` + `day_of_week^5` + `day_of_week^6` + month.L + month.Q + month.C + `month^4` + `month^5` + `month^6` + `month^7` + `month^8` + `month^9` + `month^10` + `month^11` + `Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1, method = "svmLinear",data=trainData_svm2, tuneLength = 10, metric = "MAPE")
+
+svm.tune_radial = train(scaled_agg ~hour + day_of_month + day_of_week.L + day_of_week.Q + day_of_week.C + `day_of_week^4` + `day_of_week^5` + `day_of_week^6` + month.L + month.Q + month.C + `month^4` + `month^5` + `month^6` + `month^7` + `month^8` + `month^9` + `month^10` + `month^11` + `Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1, method = "svmRadial",data=trainData_svm2, tuneLength = 10, metric = "MAPE")
+
+grid_svm_poly = expand.grid(C=c(2), degree=c(2), scale=c(2))
+
+
+svm.tune_poly = train(scaled_agg ~hour + day_of_month + day_of_week.L + day_of_week.Q + day_of_week.C + `day_of_week^4` + `day_of_week^5` + `day_of_week^6` + month.L + month.Q + month.C + `month^4` + `month^5` + `month^6` + `month^7` + `month^8` + `month^9` + `month^10` + `month^11` + `Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1, method = "svmPoly",data=trainData_svm2, tuneGrid = grid_svm_poly, metric = "MAPE")
+
+
+
+# Exploring best sigma
+
+
+grid_svm2 = expand.grid(sigma=c(0.001,0.01,0.015), C=c(0.5,1,2,3,5,10,100,200))
+
+svm.tune_2 = train(scaled_agg ~hour + day_of_month + day_of_week.L + day_of_week.Q + day_of_week.C + `day_of_week^4` + `day_of_week^5` + `day_of_week^6` + month.L + month.Q + month.C + `month^4` + `month^5` + `month^6` + `month^7` + `month^8` + `month^9` + `month^10` + `month^11` + `Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1, method = "svmRadial",data=trainData_svm2, tuneGrid = grid_svm2, metric = "MAPE")
+
+```
+
+
+
+```{r Single SVM Model Fit}
+
+modelsvm = svm(scaled_agg ~hour + day_of_month + day_of_week.L + day_of_week.Q + day_of_week.C + `day_of_week^4` + `day_of_week^5` + `day_of_week^6` + month.L + month.Q + month.C + `month^4` + `month^5` + `month^6` + `month^7` + `month^8` + `month^9` + `month^10` + `month^11` + `Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1, train_no_clus)
+
+PredictedY = predict(modelsvm, test_no_clus)
+
+paste("MAPE of single SVR predicting 6 months of aggregated electricity consumption ",mape(test_no_clus$scaled_agg, PredictedY),"%")
+
+
+```
+
+## Multiple SVR's based on clusters
+
+```{r SVR Function}
+
+SVR_Fit = function(data){
+    print("Fitting SVR")
+    modelsvm = svm(scaled_agg ~hour + day_of_month + day_of_week.L + day_of_week.Q + day_of_week.C + `day_of_week^4` + `day_of_week^5` + `day_of_week^6` + month.L + month.Q + month.C + `month^4` + `month^5` + `month^6` + `month^7` + `month^8` + `month^9` + `month^10` + `month^11` + `Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1, data, kernel="linear")
+    
+    return(modelsvm)
+}
+
+computeSVR = function(SVR, df){
+    PredictedY = predict(SVR, df)
+    df$predicted = PredictedY
+  return(df)
+}
+
+
+```
+
+```{r Fitting of SVR Models}
+
+
+mape_svr = list()
+svr_bootstrap = list()
+
+dfs_svr_bootstrap = list()
+dfs = list()
+for(m in 1){
+    for(i in 1:7){
+        i=2
+        svr_models = dlply(train_mm[[i]], .(cluster), SVR_Fit)
+        result=data.frame()
+        for(j in 1:range(train_mm[[i]]$cluster)[2]){
+            res = computeSVR(svr_models[[j]], filter(test_mm[[i]],cluster==j))
+            result = rbind(result,res)
+        }
+        df = ddply(result, .(date_time), summarise, clust_agg=sum(scaled_agg), pred_agg = sum(predicted))
+        mape_svr[[i]] = mape(df$clust_agg, df$pred_agg)
+        dfs[[i]] = df
+    }
+    svr_bootstrap[[m]]= mape_svr
+    dfs_svr_bootstrap[[m]] = dfs
+}
+mape_svr_df = data.frame(mape=unlist(mape_svr), cluster=1:7)
+
+ggplot(mape_svr_df, aes(x=cluster, y=mape))+geom_line()
+
+paste("Min MAPE ",min(mape_svr_df$mape),"%")
+
+
+
+
+svr_df2 = na.omit(svr_df1)
+
+mape(svr_df2$clust_agg, svr_df2$pred_agg)
+mape(svr_df2$clust_agg, svr_df2$naive_pred)
+
+
+svr_models = dlply(train_mm, .(cluster), SVR_Fit)
+
+result_SVR = data.frame()
+for(i in 1:2){
+    res_svr = computeSVR(svr_models[[i]], filter(test_mm,cluster==i))
+    result_SVR = rbind(result_SVR,res_svr)
+}
+
+df_svr_res = ddply(result_SVR, .(date_time), summarise, clust_agg=sum(scaled_agg), pred_agg = sum(predicted))
+
+paste("MAPE of aggregate of 4 clustered SVR's ",mape(df_svr_res$clust_agg, df_svr_res$pred_agg),"%")
+
+```
+
+```{r MASE svr}
+
+dfs_svr_bootstrap[[1]]
+
+# llply(dfs_svr_bootstrap[[1]], mutate, naive_model = lag(clust_agg,336))
+
+dfs_svr_bootstrap1_1 = llply(dfs_svr_bootstrap, function(x) llply(x, mutate, naive_model = lag(clust_agg,336)))
+
+
+
+mase = function(model_pred, naive_pred, actual, seasonal_period){
+    naive_pred = na.omit(naive_pred)
+    
+    result = sum(abs(actual-model_pred))/(length(actual)/((length(actual)-seasonal_period))*
+        sum(abs(actual[(seasonal_period+1):length(actual)]-naive_pred)))
+    return(result)
+}
+
+
+
+mase_svr = llply(dfs_svr_bootstrap1_1, function(x) laply(x, function(y) mase(y$pred_agg, y$naive_model, y$clust_agg, 336)))
+
+mape_svr = llply(dfs_svr_bootstrap1_1, function(x) laply(x, function(y) mape(y$clust_agg, y$pred_agg)))
+
+plot(mase_svr[[1]], type="l")
+plot(mape_svr[[1]], type="l")
+
+
+```
+
+```{r}
+
+mase_1 = function(forecast_value, naive_forecast, actual_value, period){
+    
+    naive_forecast = na.omit(naive_forecast)
+    
+    et = sum(abs(actual_value-forecast_value))
+    mae = sum(abs(actual_value[(period+1):length(actual_value)]-naive_forecast))*(length(actual_value)/(length(actual_value)-period))
+    MASE = et/mae
+    return(MASE)
+}
+
+
+mase1_svr = llply(dfs_svr_bootstrap1_1, function(x) laply(x, function(y) mase_1(y$pred_agg, y$naive_model, y$clust_agg, 336)))
+
+
+
+mase_2 = function(forecast_value, naive_forecast, actual_value, period){
+    
+    naive_forecast = na.omit(naive_forecast)
+    
+    et = sum(abs(actual_value-forecast_value))
+    mae = MAE(forecast_value, actual_value)
+    MASE = et/mae
+    return(MASE)
+}
+
+
+```
+
+
+
+
+
+
+
+```{r No Cal SVR}
+
+SVR_Fit_no_cal = function(data){
+    print("Fitting SVR")
+    modelsvm = svm(scaled_agg ~`Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7, data, kernel="linear")
+    
+    return(modelsvm)
+}
+
+computeSVR = function(SVR, df){
+    PredictedY = predict(SVR, df)
+    df$predicted = PredictedY
+  return(df)
+}
+
+
+mape_svr = list()
+svr_bootstrap_no_cal = list()
+for(m in 1:5){
+    for(i in 4){
+        svr_models = dlply(train_mm[[i]], .(cluster), SVR_Fit_no_cal)
+    
+        result=data.frame()
+        for(j in 1:range(train_mm[[i]]$cluster)[2]){
+            res = computeSVR(svr_models[[j]], filter(test_mm[[i]],cluster==j))
+            result = rbind(result,res)
+        }
+        df = ddply(result, .(date_time), summarise, clust_agg=sum(scaled_agg), pred_agg = sum(predicted))
+        mape_svr[[i]] = mape(df$clust_agg, df$pred_agg)
+    }
+    svr_bootstrap[[m]]=mape_svr
+}
+
+```
+
+
+## Random Forest
+
+
+```{r Tuning Random Forest}
+
+
+trainIndex_rf = createDataPartition(train_mm[[1]]$scaled_agg, p=0.1, list=FALSE)
+
+trainData_rf = train_mm[[1]][trainIndex_rf,]
+testData_rf = train_mm[[1]][-trainIndex_rf,]
+
+rf.tune = train(scaled_agg ~hour + day_of_month + day_of_week.L + day_of_week.Q + day_of_week.C + `day_of_week^4` + `day_of_week^5` + `day_of_week^6` + month.L + month.Q + month.C + `month^4` + `month^5` + `month^6` + `month^7` + `month^8` + `month^9` + `month^10` + `month^11` + `Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1, method = "rf",data=trainData_rf, tuneLength = 15, metric = "RMSE")
+
+ggplot(rf.tune$results, aes(x=mtry, y=RMSE)) + geom_line() + theme_bw(base_size = 18) + xlab("Number of variables randomly sampled as\n candidates at each split") + ylab("RMSE")+ theme(panel.grid.minor = element_blank(),panel.grid.major = element_blank())
+
+
+```
+
+
+```{r Random Forest Function}
+
+RF_Fit = function(data){
+    print("Fitting RF")
+    rf = randomForest(scaled_agg ~hour + `day_of_month` + `day_of_week.L` + `day_of_week.Q` + `day_of_week.C` + `day_of_week4` + `day_of_week5` + `day_of_week6` + month.L + month.Q + month.C + `month4` + `month5` + `month6` + `month7` + `month8` + `month9` + `month10` + `month11` + `Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1,data = data, mtry = 23)
+    return(rf)
+}
+
+rf_predict = function(rf,data){
+    predicted = predict(rf,data)
+    data$predicted = predicted
+    return(data)
+}
+
+```
+
+
+```{r Multiple Random Forests}
+train_mm_1 = plyr::rename(train_mm,c(
+    "day_of_week^4"="day_of_week4",
+    "day_of_week^5"="day_of_week5",
+    "day_of_week^6"="day_of_week6",
+    "month^4" = "month4",
+    "month^5" = "month5",
+    "month^6" = "month6",
+    "month^7" = "month7",
+    "month^8" = "month8",
+    "month^9" = "month9",
+    "month^10" = "month10",
+    "month^11" = "month11"
+    ))
+
+test_mm_1 = plyr::rename(test_mm,c(
+    "day_of_week^4"="day_of_week4",
+    "day_of_week^5"="day_of_week5",
+    "day_of_week^6"="day_of_week6",
+    "month^4" = "month4",
+    "month^5" = "month5",
+    "month^6" = "month6",
+    "month^7" = "month7",
+    "month^8" = "month8",
+    "month^9" = "month9",
+    "month^10" = "month10",
+    "month^11" = "month11"
+    ))
+
+rf_models = dlply(train_mm_1, .(cluster), RF_Fit)
+
+result_RF = data.frame()
+for(i in 1:4){
+    res_rf = rf_predict(rf_models[[i]], filter(test_mm_1,cluster==i))
+    result_RF = rbind(result_RF,res_rf)
+}
+
+df_rf = ddply(result_RF, .(date_time), summarise, clust_agg=sum(scaled_agg), pred_agg = sum(predicted))
+
+paste("MAPE of aggregate of 4 clustered Random Forests ", mape(df_rf$clust_agg, df_rf$pred_agg),"%")
+
+
+
+
+time_Optimum_Model_Single_Run = function(){
+
+    single_Prediction = data.frame()
+    for(i in 1:4){
+        res_rf = rf_predict(rf_models[[i]], filter(test_mm_1,cluster==i, date_time=="2010-06-15 00:30:00"))
+        single_Prediction = rbind(single_Prediction,res_rf)
+    }
+    single_Prediction_Agg = ddply(single_Prediction, .(date_time), summarise, pred_agg = sum(predicted))
+}
+
+# Time it takes to make predictions
+system.time(replicate(100000000,time_Optimum_Model_Single_Run))
+
+
+```
+
+```{r Single RF}
+
+train_no_clus_mm = plyr::rename(train_no_clus,c(
+    "day_of_week^4"="day_of_week4",
+    "day_of_week^5"="day_of_week5",
+    "day_of_week^6"="day_of_week6",
+    "month^4" = "month4",
+    "month^5" = "month5",
+    "month^6" = "month6",
+    "month^7" = "month7",
+    "month^8" = "month8",
+    "month^9" = "month9",
+    "month^10" = "month10",
+    "month^11" = "month11"
+    ))
+
+test_no_clus_mm = plyr::rename(test_no_clus, c(
+    "day_of_week^4"="day_of_week4",
+    "day_of_week^5"="day_of_week5",
+    "day_of_week^6"="day_of_week6",
+    "month^4" = "month4",
+    "month^5" = "month5",
+    "month^6" = "month6",
+    "month^7" = "month7",
+    "month^8" = "month8",
+    "month^9" = "month9",
+    "month^10" = "month10",
+    "month^11" = "month11"))
+
+
+
+single_RF = RF_Fit(train_no_clus_mm)
+result_single_RF = rf_predict(single_RF, test_no_clus_mm)
+
+paste("MAPE of single Random Forest ", mape(result_single_RF$scaled_agg, result_single_RF$predicted),"%")
+
+
+```
+
+```{r Varying Cluster Numbers}
+
+train_mm_1_clus = list()
+test_mm_1_clus = list()
+for(i in 1:7){
+    train_mm_1_clus[[i]] = plyr::rename(train_mm[[i]],c(
+        "day_of_week^4"="day_of_week4",
+        "day_of_week^5"="day_of_week5",
+        "day_of_week^6"="day_of_week6",
+        "month^4" = "month4",
+        "month^5" = "month5",
+        "month^6" = "month6",
+        "month^7" = "month7",
+        "month^8" = "month8",
+        "month^9" = "month9",
+        "month^10" = "month10",
+        "month^11" = "month11"
+        ))
+    
+    test_mm_1_clus[[i]] = plyr::rename(test_mm[[i]],c(
+        "day_of_week^4"="day_of_week4",
+        "day_of_week^5"="day_of_week5",
+        "day_of_week^6"="day_of_week6",
+        "month^4" = "month4",
+        "month^5" = "month5",
+        "month^6" = "month6",
+        "month^7" = "month7",
+        "month^8" = "month8",
+        "month^9" = "month9",
+        "month^10" = "month10",
+        "month^11" = "month11"
+        ))
+}
+
+
+
+
+mape_rf_1 = list()
+rf_bootstrap=list()
+
+df_rf = list()
+df_rf_bootstrap = list()
+
+for(m in 1){
+    for(i in 1:7){
+        i=4
+        rf_models = dlply(train_mm_1_clus[[i]], .(cluster), RF_Fit)
+    
+        result_rf=data.frame()
+        for(j in 1:range(train_mm_1_clus[[i]]$cluster)[2]){
+            res_rf = rf_predict(rf_models[[j]], filter(test_mm_1_clus[[i]],cluster==j))
+            result_rf = rbind(result_rf,res_rf)
+        }
+        df = ddply(result_rf, .(date_time), summarise, clust_agg=sum(scaled_agg), pred_agg = sum(predicted))
+        mape_rf_1[[i]] = mape(df$clust_agg, df$pred_agg)
+        df_rf[[i]] = df
+    }
+    rf_bootstrap[[m]] = mape_rf_1
+    df_rf_bootstrap[[m]] = df_rf
+}
+
+
+mape_rf_df_1 = data.frame(mape=unlist(mape_rf_1), cluster=1:7)
+
+ggplot(mape_rf_df, aes(x=cluster, y=mape))+geom_line()
+
+paste("Min MAPE ",min(mape_svr_df$mape),"%")
+
+
+
+
+
+
+rf_models = dlply(train_mm_1, .(cluster), RF_Fit)
+
+result_RF = data.frame()
+for(i in 1:4){
+    res_rf = rf_predict(rf_models[[i]], filter(test_mm_1,cluster==i))
+    result_RF = rbind(result_RF,res_rf)
+}
+
+df_rf = ddply(result_RF, .(date_time), summarise, clust_agg=sum(scaled_agg), pred_agg = sum(predicted))
+
+paste("MAPE of aggregate of 4 clustered Random Forests ", mape(df_rf$clust_agg, df_rf$pred_agg),"%")
+
+
+```
+
+
+```{r MASE rf}
+
+df_rf_bootstrap1_1 = llply(df_rf_bootstrap, function(x) llply(x, mutate, naive_model = lag(clust_agg,336)))
+
+
+
+
+mase_rf = llply(df_rf_bootstrap1_1, function(x) laply(x, function(y) mase(y$pred_agg, y$naive_model, y$clust_agg, 336)))
+
+plot(mase_rf[[1]], type="l")
+
+
+```
+
+
+```{r No Cal Info}
+
+RF_Fit_no_cal = function(data){
+    print("Fitting RF")
+    rf = randomForest(scaled_agg ~`Value_1` + `Value_2` + `Value_3` + `Value_4` + Value_5 + Value_6 + Prev_day1 + Prev_day2 + Prev_day3 + Prev_day4 + Prev_day5 + Prev_day6 + Prev_day7 + Week_1 + Week_2 + Week_3 + Week_4 + Week_5 + Week_6 + Week_7 + holiday1,data = data, mtry = 23)
+    return(rf)
+}
+
+
+mape_rf_1 = list()
+rf_bootstrap_no_cal=list()
+for(m in 1:5){
+    for(i in 4){
+        rf_models = dlply(train_mm_1_clus[[i]], .(cluster), RF_Fit_no_cal)
+    
+        result_rf=data.frame()
+        for(j in 1:range(train_mm_1_clus[[i]]$cluster)[2]){
+            res_rf = rf_predict(rf_models[[j]], filter(test_mm_1_clus[[i]],cluster==j))
+            result_rf = rbind(result_rf,res_rf)
+        }
+        df = ddply(result_rf, .(date_time), summarise, clust_agg=sum(scaled_agg), pred_agg = sum(predicted))
+        mape_rf_1[[i]] = mape(df$clust_agg, df$pred_agg)
+    }
+    rf_bootstrap_no_cal[[m]] = mape_rf_1
+}
+
+
+
+```
+
+# Results
+
+```{r Results}
+
+
+mape_lstm_df = data.frame(mape=unlist(mape_lstm), cluster=1:7)
+
+
+save(mape_lstm_df, file="mape_lstm_df")
+# save(mape_nn_df, file="mape_nn_df")
+save(mape_nn_df, file="mape_nn_df2")
+
+save(mape_rf)
+save(mape_svr_df, file="mape_svr_df2") # 2nd run - Linear Kernel
+save(mape_svr_df, file="mape_svr_df")
+load("mape_svr_df")
+load("mape_svr_df2")
+load("mape_nn_df")
+load("mape_nn_df2")
+
+save(mape_rf_df, file="mape_rf_df")
+
+
+results = data.frame(clusters=c(1:7), "Neural Network"=mape_nn_df$mape,SVR=mape_svr_df$mape[1:7], Random_Forest=mape_rf_df$mape,LSTM=mape_lstm_df$mape)
+
+results_plot = gather(results, key="Models", value = "MAPE", Neural.Network, SVR, Random_Forest, LSTM)
+
+results_plot1 = data.frame(clusters=c(factor(1:7)), Models = c(rep("Neural Network",7),rep("Support Vector Regression",7),rep("Random Forest",7),rep("LSTM",7)),MAPE = c(mape_nn_df$mape,mape_svr_df$mape[1:7],mape_rf_df$mape,mape_lstm_df$mape))
+
+ggplot(results_plot, aes(x=clusters, y=MAPE, colour=Models))+geom_line()+theme_bw()
+ggplot(results_plot1, aes(x=clusters, y=MAPE, linetype=Models))+geom_line()+geom_point(aes(shape=Models))+theme_bw()+ theme(legend.justification = c(1, 1), legend.position = c(0.995, 0.99),panel.grid.minor = element_blank(),panel.grid.major = element_blank(),legend.key.size=unit(2,"lines"),legend.background = element_rect(colour = 'black')) + ylab("MAPE (%)") + xlab("Number of Clusters (k)")
+```
+
+```{r summarySE}
+
+summarySE <- function(data=NULL, measurevar, groupvars=NULL, na.rm=FALSE,
+                      conf.interval=.95, .drop=TRUE) {
+    library(plyr)
+
+    # New version of length which can handle NA's: if na.rm==T, don't count them
+    length2 <- function (x, na.rm=FALSE) {
+        if (na.rm) sum(!is.na(x))
+        else       length(x)
+    }
+
+    # This does the summary. For each group's data frame, return a vector with
+    # N, mean, and sd
+    datac <- ddply(data, groupvars, .drop=.drop,
+      .fun = function(xx, col) {
+        c(N    = length2(xx[[col]], na.rm=na.rm),
+          mean = mean   (xx[[col]], na.rm=na.rm),
+          sd   = sd     (xx[[col]], na.rm=na.rm)
+        )
+      },
+      measurevar
+    )
+
+    # Rename the "mean" column    
+    datac <- rename(datac, c("mean" = measurevar))
+
+    datac$se <- datac$sd / sqrt(datac$N)  # Calculate standard error of the mean
+
+    # Confidence interval multiplier for standard error
+    # Calculate t-statistic for confidence interval: 
+    # e.g., if conf.interval is .95, use .975 (above/below), and use df=N-1
+    ciMult <- qt(conf.interval/2 + .5, datac$N-1)
+    datac$ci <- datac$se * ciMult
+
+    return(datac)
+}
+
+```
+
+
+```{r Results MASE}
+
+mase_svr[[1]]
+mase_rf[[1]]
+mase_snn[[1]]
+mase_lstm[[1]]
+
+mase_results = data.frame(cluster = rep(1:7), results = c(mase_svr[[1]], mase_rf[[1]], mase_snn[[1]], mase_lstm[[1]]), Models = c(rep("SVR",7), rep("RF",7), rep("NN",7), rep("LSTM",7)))
+
+ggplot(mase_results, aes(x=cluster,y=results,colour=Models))+
+    geom_line()+
+    geom_point(aes(shape=Models))+theme_bw()+ theme(text = element_text(size=15),panel.grid.major = element_blank(),legend.key.size=unit(2,"lines"),legend.background = element_rect(colour = 'black')) + ylab("MASE") + xlab("Number of Clusters (k)")
+```
+
+# Prediction vs Actual Plot
+
+```{r Prediction vs Actual Plot}
+
+# NEURAL NETWORK
+
+train_mm = list()
+test_mm = list()
+i=4
+train = filter(nn_data1_2[[i]], date_time < "2010-06-15") 
+test = filter(nn_data1_2[[i]], date_time >= "2010-06-15")
+
+train_mm[[i]] = as.data.frame(model.matrix(data=train, ~.))
+test_mm[[i]] = as.data.frame(model.matrix(data=test, ~.)) %>% mutate(date_time = as.POSIXct(date_time, origin='1970-01-01'))
+
+
+nn_bootstrap = list()
+mape_nn = list()
+  
+
+time_NN = system.time({clustered_NN_models = dlply(train_mm[[i]], .(cluster), NN, thresh = 0.1)})
+result=data.frame()
+for(j in 1:range(train_mm[[i]]$cluster)[2]){
+    res = computeNN(clustered_NN_models[[j]], filter(test_mm[[i]],cluster==j))
+    result = rbind(result,res)
+}
+df_nn = ddply(result, .(date_time), summarise, clust_agg=sum(scaled_agg), pred_agg = sum(predicted))
+
+
+# SUPPORT VECTOR REGRESSION
+
+
+system.time({svr_models = dlply(train_mm[[i]], .(cluster), SVR_Fit)})
+    
+result=data.frame()
+for(j in 1:range(train_mm[[i]]$cluster)[2]){
+    res = computeSVR(svr_models[[j]], filter(test_mm[[i]],cluster==j))
+    result = rbind(result,res)
+}
+df_svr = ddply(result, .(date_time), summarise, clust_agg=sum(scaled_agg), pred_agg = sum(predicted))
+
+
+
+# RANDOM FOREST
+
+mape_rf_1 = list()
+rf_bootstrap=list()
+
+i=4
+system.time({rf_models = dlply(train_mm_1_clus[[i]], .(cluster), RF_Fit)})
+
+result_rf=data.frame()
+for(j in 1:range(train_mm_1_clus[[i]]$cluster)[2]){
+    res_rf = rf_predict(rf_models[[j]], filter(test_mm_1_clus[[i]],cluster==j))
+    result_rf = rbind(result_rf,res_rf)
+}
+df_rf = ddply(result_rf, .(date_time), summarise, clust_agg=sum(scaled_agg), pred_agg = sum(predicted))
+
+
+
+# LSTM
+
+
+LSTM_Models = list()
+
+lstm_bootstrap=list()
+mape_lstm = list()
+
+
+train_list = list()
+test_list = list()
+
+lstm_num_timesteps <- 5
+
+X_train = list()
+y_train = list()
+
+X_test = list()
+y_test = list()
+
+multi_LSTM_res = data.frame()
+
+j=4
+time = list()
+for(i in 1:range(nn_data1_2[[j]]$cluster)[2]){
+    
+
+    train_list[[i]] = filter(nn_data1_2[[j]], date_time < "2010-06-15", cluster==i)$scaled_agg
+    test_list[[i]] = filter(nn_data1_2[[j]], date_time >= "2010-06-15", cluster==i)$scaled_agg
+
+    # Supervised Machine Learning Data Format
+    X_train[[i]] = t(sapply(1:(length(train_list[[i]]) - lstm_num_timesteps), function(x) train_list[[i]][x:(x + lstm_num_timesteps - 1)]))
+    
+    y_train[[i]] = sapply((lstm_num_timesteps + 1):(length(train_list[[i]])), function(x) train_list[[i]][x])
+    
+    X_test[[i]]= t(sapply(1:(length(test_list[[i]]) - lstm_num_timesteps), function(x) test_list[[i]][x:(x + lstm_num_timesteps - 1)]))
+
+    y_test[[i]] = sapply((lstm_num_timesteps + 1):(length(test_list[[i]])), function(x) test_list[[i]][x])
+    
+    X_train[[i]] = kerasR::expand_dims(X_train[[i]], axis=2)
+    X_test[[i]] = kerasR::expand_dims(X_test[[i]], axis=2)
+    
+    num_samples = dim(X_train_lstm)[1]
+    num_steps = dim(X_train_lstm)[2]
+    num_features = dim(X_train_lstm)[3]
+    
+    time[i] = system.time({LSTM_Models[[i]] = createLSTM(50, 2, X_train[[i]], y_train[[i]], 2)})
+
+
+    lstm_1 = predictLSTM_clus(LSTM_Models[[i]][[3]], X_test[[i]], arrange(filter(test_mm[[j]],cluster==i)[5:9599,],date_time))
+    multi_LSTM_res = rbind(multi_LSTM_res,lstm_1)
+
+}
+df_LSTM = ddply(multi_LSTM_res, .(date_time), summarise, clust_agg=sum(scaled_agg), pred_agg = sum(predicted))
+mape_lstm[[j]] = mape(df$clust_agg, df$pred_agg)
+
+```
+
+```{r predicted vs actual plot}
+
+
+df_NN = df
+df_actual = df
+df_actual$Model = as.factor("Real")
+df_actual$pred_agg = df_actual$clust_agg
+df_NN$Model = as.factor("Neural Network")
+df_svr$Model = as.factor("Support Vector Regression")
+df_rf$Model = as.factor("Random Forest")
+df_LSTM$Model = as.factor("LSTM")
+
+df_total = rbind(df_actual, df_NN, df_svr, df_rf, df_LSTM)
+
+df_total$Factor = as.factor(rep(c(5,1,2,3,4),each=9599))
+
+
+
+ggplot(filter(df_total, date_time>"2010-06-16", date_time< "2010-06-18"), aes(x=date_time, y=pred_agg))+geom_line(aes(colour=Model)) + xlab("Date/Time")+ylab("Scaled Electricity Consumption")+ scale_color_manual(values=c("black", "red", "#06dda3", "pink", "#06a0dd")) 
+
+
+ggplot(filter(df_total, date_time>"2010-06-16", date_time< "2010-06-18"), aes(x=date_time, y=pred_agg))+geom_line(aes(colour=Model)) + xlab("Date/Time")+ylab("Scaled Electricity Consumption")+ scale_color_manual(values=c("black", "red", "#06dda3", "pink", "#06a0dd")) 
+
+
+ggplot(filter(df_total, date_time>"2010-06-16", date_time< "2010-06-18"), aes(x=date_time, y=pred_agg))+geom_line(aes(colour=Model)) + xlab("Date/Time")+ylab("Scaled Electricity Consumption (kWh)")+ scale_color_manual(values=c("black", "red", "#06dda3", "pink", "#06a0dd")) + theme_bw(base_size = 18) + theme(panel.spacing.x = unit(2, "lines"))
+
+
+predictions_no_actual_leg = ggplot() + 
+    geom_line(data = filter(df_NN, date_time>"2010-06-16", date_time< "2010-06-18"), aes(x=date_time, y=pred_agg, colour='red')) + 
+    geom_line(data = filter(df_svr, date_time>"2010-06-16", date_time< "2010-06-18"), aes(x=date_time, y=pred_agg, colour='blue')) + 
+    geom_line(data = filter(df_rf, date_time>"2010-06-16", date_time< "2010-06-18"), aes(x=date_time, y=pred_agg, colour='green')) + 
+    geom_line(data = filter(df_rf, date_time>"2010-06-16", date_time< "2010-06-18"), aes(x=date_time, y=pred_agg, colour='grey')) + 
+    geom_line(data = filter(df_actual, date_time>"2010-06-16", date_time< "2010-06-18"), aes(x=date_time, y=pred_agg, color='black'), colour="black") + 
+    scale_color_discrete(name = "Series", labels = c("NN", "SVR","RF","LSTM","Real")) +
+    xlab("Date/Time") + ylab("Scaled Electricity Consumption (kWh)")+ theme_bw(base_size = 18) + theme(panel.spacing.x = unit(2, "lines"))
+
+predictions_no_actual_leg
+
+ggsave("actual_vs_predicted.png", predictions_no_actual_leg)
+
+ggplot(filter(df_total, date_time>"2010-06-16", date_time< "2010-06-18"), aes(x=date_time, y=pred_agg, colour=Factor))+
+    geom_line() +
+    scale_color_manual(values=c("#06a0dd", "red", "#06dda3", "pink", "black")) +
+    scale_color_discrete(name = "Series", labels = c("Neural Network", "SVR","RF","LSTM","Actual"))
+
+```
+
+
+
+```{r final plot}
+
+save(nn_bootstrap, file="nn_bootstrap")
+save(svr_bootstrap, file="svr_bootstrap")
+save(rf_bootstrap, file="rf_bootstrap")
+save(lstm_bootstrap, file = "lstm_bootstrap")
+
+load("nn_bootstrap")
+load("svr_bootstrap")
+load("rf_bootstrap")
+load("lstm_bootstrap")
+
+
+
+nn_bootstrap_df = data.frame(Model = "Neural Network", cluster=c(1:7), matrix(unlist(nn_bootstrap), ncol=5))
+nn_bootstrap_svr = data.frame(Model = "Support Vector Regression",cluster=c(1:7), matrix(unlist(svr_bootstrap), ncol=5))
+nn_bootstrap_rf = data.frame(Model = "Random Forest",cluster=c(1:7), matrix(unlist(rf_bootstrap), ncol=5))
+nn_bootstrap_lstm = data.frame(Model = "LSTM",cluster=c(1:7), matrix(unlist(lstm_bootstrap), ncol=5))
+
+results_tot = rbind(nn_bootstrap_df,nn_bootstrap_svr,nn_bootstrap_rf,nn_bootstrap_lstm)
+
+results_gath = gather(results_tot, key="runs",value="MAPE", X1,X2,X3,X4,X5)
+
+rg = summarySE(results_gath, measurevar="MAPE", groupvars = c("Model","cluster"))
+
+pd <- position_dodge(0.1) # move them .05 to the left and right
+
+ggplot(rg, aes(x=cluster, y=MAPE, colour=Model)) + 
+    geom_errorbar(aes(ymin=MAPE-se, ymax=MAPE+se), colour="black", width=.1)+
+    geom_line() +
+    geom_point(size=2, shape=21, fill="white")+theme_bw(base_size = 18) + 
+    theme(legend.justification = c(1, 1), legend.position = c(0.995, 0.99),legend.background = element_rect(colour = 'black')) + 
+    ylab("MAPE (%)") + 
+    xlab("Number of Clusters (k)")
+
+```
+
+```{r Results no cal}
+
+save(nn_bootstrap_no_cal, file="nn_bootstrap_no_cal")
+
+svr_bootstrap_no_cal = c(5.216172278,5.216172278,5.216172278,5.216172278,5.216172278)
+
+save(svr_bootstrap_no_cal, file="svr_bootstrap_no_cal")
+save(rf_bootstrap_no_cal, file="rf_bootstrap_no_cal")
+
+load("rf_bootstrap_no_cal")
+load("svr_bootstrap_no_cal")
+load("nn_bootstrap_no_cal")
+
+nn_bootstrap_no_cal_unl = c(nn_bootstrap_no_cal[[1]][[4]],nn_bootstrap_no_cal[[2]][[4]],nn_bootstrap_no_cal[[3]][[4]],nn_bootstrap_no_cal[[4]][[4]],nn_bootstrap_no_cal[[5]][[4]])
+
+svr_bootstrap_no_cal_unl = svr_bootstrap_no_cal
+rf_bootstrap_no_cal_unl = unlist(rf_bootstrap_no_cal)
+
+no_cal_results = data.frame(nn_no_cal = nn_bootstrap_no_cal_unl, nn = t(filter(nn_bootstrap_df, cluster==4)[,3:7]), svr_no_cal = svr_bootstrap_no_cal_unl, svr = t(filter(nn_bootstrap_svr, cluster==4)[,3:7]), rf_no_cal = rf_bootstrap_no_cal_unl, rf = t(filter(nn_bootstrap_rf, cluster==4)[,3:7]))
+
+no_cal_results_long = gather(no_cal_results, key="model", value="mape")
+no_cal_results_long$Attributes = c("No Calendar Variables","No Calendar Variables","No Calendar Variables","No Calendar Variables","No Calendar Variables","Calendar","Calendar","Calendar","Calendar","Calendar","No Calendar Variables","No Calendar Variables","No Calendar Variables","No Calendar Variables","No Calendar Variables","Calendar","Calendar","Calendar","Calendar","Calendar","No Calendar Variables","No Calendar Variables","No Calendar Variables","No Calendar Variables","No Calendar Variables","Calendar","Calendar","Calendar","Calendar","Calendar")
+
+no_cal_results_long$mod = c("Neural Network","Neural Network","Neural Network","Neural Network","Neural Network","Neural Network","Neural Network","Neural Network","Neural Network","Neural Network","SVR","SVR","SVR","SVR","SVR","SVR","SVR","SVR","SVR","SVR","Random Forest","Random Forest","Random Forest","Random Forest","Random Forest","Random Forest","Random Forest","Random Forest","Random Forest","Random Forest")
+
+
+ggplot(no_cal_results_long, aes(x=mod, y=mape, colour=Attributes))+geom_boxplot()+xlab("Model")+ylab("Mean Absolute Percentage Error (MAPE)")+theme_bw(base_size = 18)+theme(legend.position = "bottom",legend.box.background = element_rect(size = 1))
+
+```
+
+
+```{r Training time}
+system.time(dlply(train_mm[[1]], .(cluster), NN, thresh = 0.1))
+
+system.time(dlply(train_mm[[1]], .(cluster), SVR_Fit))
+
+system.time(dlply(train_mm_1_clus[[1]], .(cluster), RF_Fit))
+
+system.time(createLSTM(50, 2, X_train[[1]], y_train[[1]], 2))
+
+```
+
+# References
+
